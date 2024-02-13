@@ -6,7 +6,7 @@ public class StringUtils {
   public static String CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   public static Random random = new Random(0);
 
-  public static String generate_random_string(int length) {
+  public static String generate_random_string(int length, Random random) {
     StringBuilder stringBuilder = new StringBuilder(length);
 
     for (int i = 0; i < length; i++) {
@@ -16,6 +16,10 @@ public class StringUtils {
     }
 
     return stringBuilder.toString();
+  }
+
+  public static String generate_random_string(int length) {
+    return generate_random_string(length, random);
   }
 
   public static boolean some_arg_is_set(String... args) {

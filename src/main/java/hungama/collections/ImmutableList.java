@@ -2,19 +2,7 @@ package hungama.collections;
 
 import java.io.*;
 import java.nio.file.*;
-
-record OffsetLengthPair(long offset, int length) {
-    public OffsetLengthPair(long offset, int length) {
-        if (offset <= 0) {
-            throw new IllegalArgumentException("offset cannot be less than or equal to zero");
-        }
-        if (length <= 0) {
-            throw new IllegalArgumentException("length cannot le less than or equal to zero.");
-        }
-        this.offset = offset;
-        this.length = length;
-    }
-}
+import java.util.*;
 
 record Header(long version, int capacity, int size) {
     public Header(long version, int capacity, int size) {
@@ -30,16 +18,27 @@ record Header(long version, int capacity, int size) {
     }
 }
 
-public class ImmutableList implements Closeable {
+/**
+ * Provides a fixed-size list backed by disk storage.
+ * Insertions and lookups are O(1) as is the main memory consumption.
+ */
+public class ImmutableList implements Closeable, Iterable<byte[]> {
 
+    private static final int VERSION = 1;
     private static final int HEADER_LENGTH = Long.BYTES + Integer.BYTES * 2;
-    private static final int OFFSET_LENGTH_PAIR_LENGTH = Long.BYTES + Integer.BYTES;
+    private static final int OFFSET_LENGTH = Long.BYTES;
 
     private RandomAccessFile raf;
     private int size;
     private final int capacity;
     private final boolean readOnly;    
 
+    /**
+     * Creates a new immutable list with given {@code capacity}
+     * @param path name of file that will be used to store this list
+     * @param capacity the capacity of the list (number of elements it can contain)
+     * @throws IOException
+     */
     public ImmutableList(Path path, int capacity) throws IOException {
         if (capacity <= 0) {
             throw new IllegalArgumentException("capacity");
@@ -57,7 +56,7 @@ public class ImmutableList implements Closeable {
         this.size = 0;
         this.readOnly = false;
         this.writeHeader(capacity);
-        byte[] b = new byte[capacity * OFFSET_LENGTH_PAIR_LENGTH];
+        byte[] b = new byte[capacity * OFFSET_LENGTH];
         this.raf.write(b);
     }
     
@@ -76,9 +75,16 @@ public class ImmutableList implements Closeable {
         RandomAccessFile raf = new RandomAccessFile(f, "r");
         this.raf = raf;
         Header header = readHeader();
+        checkVersion(header.version());
         this.size = header.size();
         this.capacity = header.capacity();        
         this.readOnly = true;
+    }
+
+    private static void checkVersion(long version) {
+        if (version != VERSION) {
+            throw new DBException("wrong version. expected: " + VERSION + " found: " + version);
+        }
     }
 
     private synchronized Header readHeader() throws IOException {
@@ -94,7 +100,7 @@ public class ImmutableList implements Closeable {
 
     private synchronized void writeHeader(int capacity) throws IOException {
         this.raf.seek(0);
-        this.raf.writeLong(0L);
+        this.raf.writeLong(VERSION);
         this.raf.writeInt(capacity);
         this.raf.writeInt(0);
     }
@@ -106,22 +112,49 @@ public class ImmutableList implements Closeable {
         if (size > capacity) {
             throw new IllegalArgumentException("size");
         }
-        this.raf.seek(Long.BYTES + Integer.BYTES);
+        this.raf.seek(Long.BYTES + Integer.BYTES); // skip version and capacity fields in the header
         this.raf.writeInt(size);
     }
 
+    /**
+     * Opens a pre-existing list from given file location
+     * @param path file containing the list
+     * @return
+     * @throws IOException
+     */
     public static ImmutableList open(Path path) throws IOException {
         return new ImmutableList(path); 
     }
 
+    /**
+     * Number of elements in the list. It can be less than the capacity if the list was not "filled to the top" when it was created.
+     * @return
+     */
     public int size() {
         return this.size;
     }
 
+    /**
+     * The maximum number of elements this list can contain.
+     * @return
+     */
     public int capacity() {
         return this.capacity;
     }
 
+    /**
+     * Returns the size of underlying file in bytes.
+     * @return
+     */
+    public long fileSize() throws IOException {
+        return this.raf.length();
+    }
+
+    /**
+     * Adds element to the list.
+     * @param data the element to add to the list. must not be empty.
+     * @throws IOException
+     */
     public synchronized void add(byte[] data) throws IOException {
         checkCanWrite();
         if (this.size >= this.capacity) {
@@ -133,13 +166,20 @@ public class ImmutableList implements Closeable {
         long currOffset = raf.length();
         assert currOffset > 0;
         raf.seek(offsetPos(size));
-        raf.writeLong(currOffset);
-        raf.writeInt(data.length);
+        raf.writeLong(currOffset);        
         raf.seek(currOffset);
+        raf.writeInt(data.length);
         raf.write(data);
-        this.size++;        
+        this.size++;
+        this.writeSize(size);
     }    
 
+    /**
+     * Gets element at given position in the list
+     * @param index the index of the element you want to fetch. should be between 0 and {@code size} of the list.
+     * @return
+     * @throws IOException
+     */
     public synchronized byte[] get(int index) throws IOException {
         if (index < 0) {
             throw new IllegalArgumentException("index cannot be less than zero");
@@ -147,19 +187,54 @@ public class ImmutableList implements Closeable {
         if (index >= this.size) {
             throw new IllegalArgumentException("index cannot be greater than size");
         }
-        OffsetLengthPair pair = readOffsetLengthPair(index);
-        if (pair.offset() <= 0) {
-            throw new RuntimeException("invalid offset. possible data corruption");
+        long offset = getDataOffset(index);
+        raf.seek(offset);
+        int length = raf.readInt();
+        if (length <= 0) {
+            throw new DBException("bad length.");
         }
-        if (pair.length() <= 0) {
-            throw new RuntimeException("invalid length. possible data corruption");
+        if (length > raf.length() - offset) {
+            throw new DBException("bad length.");
         }
-        raf.seek(pair.offset());
-        byte[] buf = new byte[pair.length()];
+        byte[] buf = new byte[length];
         raf.readFully(buf);
         return buf;
     }
 
+    /**
+     * Load entire collection into memory.
+     * @return
+     * @throws IOException
+     */
+    public synchronized List<byte[]> getAll() throws IOException {
+        if (this.size == 0) {
+            return new ArrayList<>();
+        }
+        long offset = getDataOffset(0);
+        assert offset > 0;
+        assert offset < raf.length();        
+        raf.seek(offset);
+        List<byte[]> list = new ArrayList<>(this.size);
+        for (int i = 0; i < this.size; i++) {
+            int length = raf.readInt();
+            if (length <= 0) {
+                throw new DBException("bad length.");
+            }
+            if (length > raf.length() - offset) {
+                throw new DBException("bad length.");
+            }
+            byte[] buf = new byte[length];
+            raf.readFully(buf);
+            list.add(buf);
+        }        
+        return list;
+    }
+
+    /**
+     * Releases all resources consumed by this class.
+     * Once an instance of the class is closed, it should not be used. 
+     * A new instance must be created.
+     */
     @Override
     public synchronized void close() throws IOException {
         if (raf != null) {
@@ -178,16 +253,62 @@ public class ImmutableList implements Closeable {
     }
 
     private long offsetPos(int index) {
-        return HEADER_LENGTH + index * OFFSET_LENGTH_PAIR_LENGTH;
+        return HEADER_LENGTH + index * OFFSET_LENGTH;
     }
 
-    private OffsetLengthPair readOffsetLengthPair(int index) throws IOException {
+    private synchronized long getDataOffset(int index) throws IOException {
         if (index < 0 || index >= size) {
             throw new IllegalArgumentException("index");
         }
         raf.seek(offsetPos(index));
         long offset = raf.readLong();
-        int length = raf.readInt();
-        return new OffsetLengthPair(offset, length);
+        if (offset <= 0 || offset > raf.length()) {
+            throw new DBException("bad offset.");
+        }        
+        return offset;
+    }
+
+    @Override
+    public Iterator<byte[]> iterator() {
+        return new MyIterator();       
+    }
+
+    private class MyIterator implements Iterator<byte[]> {
+
+        private int index;
+
+        public MyIterator() {
+            if (hasNext()) {
+                try {
+                    raf.seek(getDataOffset(0));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }            
+        }
+
+        @Override
+        public boolean hasNext() {
+            return index < ImmutableList.this.size;
+        }
+
+        @Override
+        public byte[] next() {
+            try {
+                int length = raf.readInt();
+                if (length <= 0) {
+                    throw new DBException("bad length.");
+                }
+                if (length > raf.length() - raf.getFilePointer()) {
+                    throw new DBException("bad length.");
+                }
+                byte[] buf = new byte[length];
+                ImmutableList.this.raf.readFully(buf);
+                index++;
+                return buf;
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
     }
 }

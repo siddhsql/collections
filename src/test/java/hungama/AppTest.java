@@ -7,26 +7,25 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.*;
 
 import hungama.collections.*;
 
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 public class AppTest 
 {
     private static Path path;
-
-    // see https://stackoverflow.com/questions/29671796/will-an-assertion-error-be-caught-by-in-a-catch-block-for-java-exception
-    // for why we must use Before/After hooks and not try-catch block.
-    // you cannot catch errors. you can only catch exceptions.
+    private static List<byte[]> data;
+    private static int N = 10;
 
     @BeforeAll
     public static void setup() {
         String tempDir = System.getProperty("java.io.tmpdir");
-        String tempFilename = StringUtils.generate_random_string(8);
+        String tempFilename = StringUtils.generate_random_string(8, new Random(System.currentTimeMillis()));
         path = Path.of(tempDir, tempFilename + ".bin");
+        data = generateData(N);
     }
 
     @AfterAll
@@ -34,17 +33,9 @@ public class AppTest
         if (path.toFile().exists()) {
             Files.delete(path);
         }
-    }
+    }    
 
-    @Test
-    public void test1() throws IOException {
-        int n = 10;        
-        var data = generateData(n);
-        insertRecords(path, data);
-        queryRecords(path, data);        
-    }
-
-    private List<byte[]> generateData(int n) {
+    private static List<byte[]> generateData(int n) {
         List<byte[]> list = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
             list.add(StringUtils.generate_random_string(100).getBytes());
@@ -52,19 +43,22 @@ public class AppTest
         return list;
     }
 
-    private void insertRecords(Path path, List<byte[]> list) throws IOException {
-        int capacity = list.size();
+    @Test
+    @Order(1)
+    public void insertRecords() throws IOException {
+        int capacity = data.size();
         try (ImmutableList immutableList = new ImmutableList(path, capacity)) {
             for (int i = 0; i < capacity; i++) {
-                byte[] data = list.get(i);
                 assertTrue(immutableList.size() == i);
-                immutableList.add(data);
+                immutableList.add(data.get(i));
                 assertTrue(immutableList.size() == i + 1);
             }
         }
     }
 
-    private void queryRecords(Path path, List<byte[]> data) throws IOException {
+    @Test
+    @Order(2)
+    public void queryRecords() throws IOException {
         int n = data.size();
         int[] indices = PermutationUtils.permutation(n);
         try (ImmutableList list = ImmutableList.open(path)) {
@@ -72,6 +66,19 @@ public class AppTest
                 int index = indices[i];
                 byte[] observed = list.get(index);
                 byte[] expected = data.get(index);
+                assertArrayEquals(expected, observed);
+            }
+        }
+    }
+
+    @Test
+    @Order(3)
+    public void enumerateRecords() throws IOException {
+        try (ImmutableList list = ImmutableList.open(path)) {
+            assertEquals(list.size(), data.size());
+            int i = 0;
+            for (byte[] observed : list) {
+                byte[] expected = data.get(i++);
                 assertArrayEquals(expected, observed);
             }
         }
